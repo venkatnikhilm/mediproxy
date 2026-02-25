@@ -1,0 +1,43 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:14.20
+    environment:
+      POSTGRES_DB: shadowguard
+      POSTGRES_USER: shadowguard
+      POSTGRES_PASSWORD: shadowguard
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shadowguard"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://shadowguard:shadowguard@postgres:5432/shadowguard
+      VAPI_ENABLED: ${VAPI_ENABLED:-false}
+      VAPI_API_KEY: ${VAPI_API_KEY:-}
+      VAPI_PHONE_NUMBER_ID: ${VAPI_PHONE_NUMBER_ID:-}
+      VAPI_ASSISTANT_ID: ${VAPI_ASSISTANT_ID:-}
+      ALERT_PHONE_NUMBER: ${ALERT_PHONE_NUMBER:-}
+      CALL_COOLDOWN_SECONDS: ${CALL_COOLDOWN_SECONDS:-300}
+
+  dashboard:
+    build: ./dashboard
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
