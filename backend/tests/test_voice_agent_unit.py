@@ -75,7 +75,7 @@ def test_system_prompt_contains_identity():
     from deepgram_agent import _build_system_prompt
 
     prompt = _build_system_prompt(SAMPLE_EVENT)
-    assert "ShadowGuard compliance assistant" in prompt
+    assert "MediProxy compliance assistant" in prompt
 
 
 def test_system_prompt_contains_event_fields():
@@ -197,7 +197,7 @@ def test_twiml_contains_say_and_stream():
     body = response.text
 
     assert "<Say>" in body
-    assert "ShadowGuard compliance agent" in body
+    assert "MediProxy compliance agent" in body
     assert "<Stream" in body
     assert "voice-agent/1" in body
 

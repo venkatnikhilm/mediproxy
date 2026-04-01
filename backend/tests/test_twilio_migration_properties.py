@@ -262,7 +262,7 @@ def test_twiml_response_correctness(cid, host):
 
     # Must contain the Say greeting
     assert "<Say>" in body
-    assert "ShadowGuard compliance agent" in body
+    assert "MediProxy compliance agent" in body
 
     # Must contain Connect > Stream
     assert "<Connect>" in body

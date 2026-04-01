@@ -1,94 +1,143 @@
 #!/bin/bash
-# ShadowGuard - Quick Setup Script
-# Run this on your laptop (macOS or Linux)
+# MediProxy - One-Command Setup
+# Starts Docker containers, installs mitmproxy cert, launches proxy + browser
+# Usage: bash setup.sh
 
 set -e
 
-echo "🛡️  ShadowGuard Test Setup"
-echo "========================="
-echo ""
-
-# Detect OS
-OS=$(uname -s)
-echo "Detected OS: $OS"
-
-# Step 1: Install mitmproxy
-echo ""
-echo "📦 Step 1: Installing mitmproxy..."
-if command -v mitmdump &> /dev/null; then
-    echo "  ✅ mitmproxy already installed: $(mitmdump --version | head -1)"
-else
-    if [ "$OS" == "Darwin" ]; then
-        echo "  Installing via brew..."
-        brew install mitmproxy
-    else
-        echo "  Installing via pip..."
-        pip install mitmproxy
-    fi
-    echo "  ✅ mitmproxy installed"
-fi
-
-# Step 2: Install Python dependencies for the addon
-echo ""
-echo "📦 Step 2: Installing Python dependencies..."
-pip install requests 2>/dev/null || pip install requests --break-system-packages 2>/dev/null
-echo "  ✅ Dependencies installed"
-
-# Step 3: Generate mitmproxy CA cert (first run creates it)
-echo ""
-echo "🔐 Step 3: Generating mitmproxy CA certificate..."
-# Start and immediately stop mitmdump to generate certs
-timeout 2 mitmdump --listen-port 18080 2>/dev/null || true
+PROXY_PORT=8080
 CERT_DIR="$HOME/.mitmproxy"
-if [ -f "$CERT_DIR/mitmproxy-ca-cert.pem" ]; then
-    echo "  ✅ CA cert generated at: $CERT_DIR/mitmproxy-ca-cert.pem"
-else
-    echo "  ⚠️  Cert not found. It'll be generated on first run."
-fi
+CERT_FILE="$CERT_DIR/mitmproxy-ca-cert.pem"
 
-# Step 4: Install CA cert into system trust store
+echo "🛡️  MediProxy Setup"
+echo "==================="
+
+# ── Step 1: Check prerequisites ────────────────────────────
 echo ""
-echo "🔐 Step 4: Installing CA certificate..."
-if [ "$OS" == "Darwin" ]; then
-    echo "  On macOS, we'll open Keychain Access."
-    echo "  You need to:"
-    echo "    1. Double-click the cert to add it"
-    echo "    2. Find 'mitmproxy' in Keychain"
-    echo "    3. Double-click it → Trust → 'Always Trust'"
-    echo ""
-    read -p "  Press Enter to open the cert in Keychain Access..."
-    open "$CERT_DIR/mitmproxy-ca-cert.pem" 2>/dev/null || echo "  Open manually: $CERT_DIR/mitmproxy-ca-cert.pem"
-    echo ""
-    echo "  ⚠️  IMPORTANT: After adding, set it to 'Always Trust'!"
-    echo "  (Double-click the cert in Keychain → Trust → Always Trust)"
-    read -p "  Press Enter once you've trusted the cert..."
-elif [ "$OS" == "Linux" ]; then
-    echo "  Installing cert system-wide (needs sudo)..."
-    sudo cp "$CERT_DIR/mitmproxy-ca-cert.pem" /usr/local/share/ca-certificates/mitmproxy.crt
-    sudo update-ca-certificates
-    echo "  ✅ CA cert installed system-wide"
+echo "📋 Checking prerequisites..."
+
+if ! command -v docker &> /dev/null; then
+    echo "  ❌ Docker not found. Install Docker Desktop first."
+    exit 1
+fi
+echo "  ✅ Docker"
+
+if ! command -v mitmdump &> /dev/null; then
+    echo "  📦 Installing mitmproxy..."
+    brew install mitmproxy 2>/dev/null || pip3 install mitmproxy
+fi
+echo "  ✅ mitmproxy"
+
+if ! command -v cloudflared &> /dev/null; then
+    echo "  📦 Installing cloudflared..."
+    brew install cloudflared 2>/dev/null || echo "  ⚠️  Install cloudflared manually for Twilio voice calls"
+fi
+if command -v cloudflared &> /dev/null; then
+    echo "  ✅ cloudflared"
 fi
 
-# Step 5: Summary
+# ── Step 2: Generate and trust mitmproxy CA cert ──────────
+echo ""
+echo "🔐 Setting up mitmproxy CA certificate..."
+
+if [ ! -f "$CERT_FILE" ]; then
+    echo "  Generating cert (first-time setup)..."
+    timeout 3 mitmdump --listen-port 18080 2>/dev/null || true
+    sleep 1
+fi
+
+if [ -f "$CERT_FILE" ]; then
+    # Check if cert is already trusted
+    if security find-certificate -c "mitmproxy" /Library/Keychains/System.keychain &>/dev/null 2>&1 || \
+       security find-certificate -c "mitmproxy" ~/Library/Keychains/login.keychain-db &>/dev/null 2>&1; then
+        echo "  ✅ CA cert already trusted"
+    else
+        echo "  Installing CA cert into macOS Keychain (requires password)..."
+        sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$CERT_FILE" 2>/dev/null && \
+            echo "  ✅ CA cert trusted automatically" || {
+            echo "  ⚠️  Auto-trust failed. Opening cert manually..."
+            open "$CERT_FILE"
+            echo "  → Find 'mitmproxy' in Keychain Access"
+            echo "  → Double-click → Trust → Always Trust"
+            read -p "  Press Enter once you've trusted the cert..."
+        }
+    fi
+else
+    echo "  ⚠️  Cert will be generated on first proxy run"
+fi
+
+# ── Step 3: Start Docker containers ───────────────────────
+echo ""
+echo "🐳 Starting Docker containers..."
+docker compose down 2>/dev/null || true
+docker compose up --build -d
+
+echo "  Waiting for backend to be ready..."
+for i in $(seq 1 30); do
+    if curl -s http://localhost:8000/api/health > /dev/null 2>&1; then
+        echo "  ✅ Backend ready"
+        break
+    fi
+    if [ "$i" -eq 30 ]; then
+        echo "  ❌ Backend failed to start. Check: docker compose logs backend"
+        exit 1
+    fi
+    sleep 1
+done
+
+echo "  ✅ Dashboard at http://localhost:3000"
+
+# ── Step 4: Seed the database ─────────────────────────────
+echo ""
+echo "🌱 Seeding database with demo events..."
+curl -s -X POST http://localhost:8000/api/seed > /dev/null 2>&1
+echo "  ✅ Database seeded"
+
+# ── Step 5: Start mitmproxy in background ─────────────────
+echo ""
+echo "🔀 Starting mitmproxy..."
+
+# Kill any existing mitmproxy on the port
+lsof -ti:$PROXY_PORT | xargs kill -9 2>/dev/null || true
+sleep 1
+
+mitmdump -s shadowguard_addon.py --listen-port $PROXY_PORT --set block_global=false --set stream_large_bodies=1m -q &
+MITM_PID=$!
+sleep 2
+
+if kill -0 $MITM_PID 2>/dev/null; then
+    echo "  ✅ mitmproxy running on port $PROXY_PORT (PID: $MITM_PID)"
+else
+    echo "  ❌ mitmproxy failed to start"
+    exit 1
+fi
+
+# ── Step 6: Launch proxied Chrome ─────────────────────────
+echo ""
+echo "🌐 Launching proxied Chrome..."
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    --proxy-server="http://localhost:$PROXY_PORT" \
+    --user-data-dir=/tmp/mediproxy-chrome \
+    --no-first-run \
+    --no-default-browser-check \
+    "http://localhost:3000" &>/dev/null &
+
+echo "  ✅ Proxied Chrome opened with dashboard"
+
+# ── Done ──────────────────────────────────────────────────
 echo ""
 echo "========================================="
-echo "✅ Setup complete!"
+echo "✅ MediProxy is running!"
 echo ""
-echo "To start intercepting:"
-echo "  1. Start the proxy:"
-echo "     mitmdump -s shadowguard_addon.py --listen-port 8080"
+echo "  Dashboard:  http://localhost:3000"
+echo "  Backend:    http://localhost:8000"
+echo "  Proxy:      localhost:$PROXY_PORT"
 echo ""
-echo "  2. Test with browser (open a new Chrome window):"
-echo "     On macOS:"
-echo "       open -na 'Google Chrome' --args --proxy-server='http://localhost:8080'"
-echo "     On Linux:"
-echo "       google-chrome --proxy-server='http://localhost:8080'"
+echo "  Use the proxied Chrome window to browse"
+echo "  AI services. PHI will be detected and"
+echo "  high-risk events trigger phone calls."
 echo ""
-echo "  3. Test with terminal:"
-echo "     export HTTPS_PROXY=http://localhost:8080"
-echo "     export SSL_CERT_FILE=$CERT_DIR/mitmproxy-ca-cert.pem"
-echo "     curl https://api.openai.com/v1/models"
-echo ""
-echo "  4. Or run the test script:"
-echo "     python3 test_interception.py"
+echo "  To stop everything:"
+echo "    kill $MITM_PID          # stop proxy"
+echo "    docker compose down     # stop containers"
 echo "========================================="

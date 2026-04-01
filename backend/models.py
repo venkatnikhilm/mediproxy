@@ -1,5 +1,5 @@
 """
-Pydantic models for ShadowGuard API request/response validation.
+Pydantic models for Mediproxy API request/response validation.
 """
 
 from pydantic import BaseModel, Field

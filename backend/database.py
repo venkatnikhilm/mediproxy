@@ -1,5 +1,5 @@
 """
-PostgreSQL connection and table creation for ShadowGuard.
+PostgreSQL connection and table creation for Mediproxy.
 Uses psycopg2 with a connection pool.
 """
 

@@ -1,5 +1,5 @@
 """
-Deepgram Voice Agent helpers for ShadowGuard.
+Deepgram Voice Agent helpers for Mediproxy.
 
 Provides configuration builders and connection utilities for the
 Deepgram Voice Agent API used by the WebSocket bridge endpoint.
@@ -46,11 +46,23 @@ def _build_system_prompt(event_data: dict) -> str:
     redacted_text = event_data.get("redacted_text", "")
     timestamp = event_data.get("timestamp", "unknown")
 
+    # Extract patient name from phi_findings if present
+    patient_name = None
+    findings = event_data.get("phi_findings", [])
+    if isinstance(findings, list):
+        for f in findings:
+            if isinstance(f, dict) and f.get("type") == "PERSON" and f.get("value"):
+                patient_name = f["value"]
+                break
+
+    patient_line = f"Patient name: {patient_name}\n" if patient_name else ""
+
     return (
-        "You are the ShadowGuard compliance assistant. "
+        "You are the MediProxy compliance assistant. "
         "You are on a phone call with a compliance officer about a PHI exposure event.\n\n"
         f"Service: {ai_service}\n"
         f"PHI types: {phi_types}\n"
+        f"{patient_line}"
         f"Risk score: {risk_score}\n"
         f"Severity: {severity}\n"
         f"Source IP: {source_ip}\n"

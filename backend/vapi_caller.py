@@ -1,5 +1,5 @@
 """
-Twilio Voice Alert integration for ShadowGuard.
+Twilio Voice Alert integration for MediProxy.
 Triggers automated outbound phone calls for high-risk PHI exposure events
 using Twilio REST API + Media Streams for bidirectional WebSocket audio.
 

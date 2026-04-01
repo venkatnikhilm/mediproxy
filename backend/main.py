@@ -1,5 +1,5 @@
 """
-ShadowGuard FastAPI Backend
+Mediproxy FastAPI Backend
 Healthcare Shadow AI Detection & Governance System
 
 Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -430,7 +430,7 @@ def twiml_endpoint(call_db_id: int):
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        "<Say>Please hold, connecting you to the ShadowGuard compliance agent.</Say>"
+        "<Say>Please hold, connecting you to the MediProxy compliance agent.</Say>"
         "<Connect>"
         f'<Stream url="{stream_url}" />'
         "</Connect>"
