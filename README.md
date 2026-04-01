@@ -2,7 +2,7 @@
 
 **Healthcare AI Security & PHI Protection System**
 
-MediProxy AI intercepts HTTPS traffic to AI services (ChatGPT, Claude, Gemini), detects Protected Health Information (PHI) using NLP, redacts it in real-time, and provides a cybersecurity-themed governance dashboard with live WebSocket updates and automated voice alerts.
+MediProxy AI intercepts HTTPS traffic to AI services (ChatGPT, Claude, Gemini, DeepSeek, and more), detects Protected Health Information (PHI) using NLP, redacts it in real-time, and provides a cybersecurity-themed governance dashboard with live WebSocket updates. When high-risk PHI exposure is detected, MediProxy automatically calls a compliance officer via Twilio and connects them to a Deepgram-powered AI voice agent that briefs them on the incident and can update event status via voice commands.
 
 ---
 
@@ -14,98 +14,146 @@ MediProxy AI intercepts HTTPS traffic to AI services (ChatGPT, Claude, Gemini), 
                     │  + addon     │
                     └──────┬───────┘
                            │ POST /api/events
-                    ┌──────▼───────┐
-                    │   FastAPI    │ ──► VAPI Voice Calls (high-risk alerts)
-                    │   Backend    │
-                    └──────┬───────┘
-                           │ WebSocket + REST
-                    ┌──────▼───────┐
-                    │    React     │
-                    │  Dashboard   │
-                    └──────────────┘
+                    ┌──────▼───────┐         ┌─────────────┐
+                    │   FastAPI    │ ──────►  │   Twilio    │ ──► Phone Call
+                    │   Backend    │ ◄──────  │   Media     │
+                    └──────┬───────┘         │   Streams   │
+                           │                  └─────────────┘
+                           │ WebSocket                │
+                    ┌──────▼───────┐         ┌────────▼──────┐
+                    │    React     │         │   Deepgram    │
+                    │  Dashboard   │         │  Voice Agent  │
+                    └──────────────┘         └───────────────┘
 ```
+
+### Call Flow
+
+1. Proxy detects high-risk PHI event (severity critical/high, risk score >= 70)
+2. Backend triggers outbound call via Twilio REST API
+3. Twilio fetches TwiML from `/api/twiml/{call_db_id}` — plays greeting, opens Media Stream
+4. Twilio connects bidirectional WebSocket to `/api/voice-agent/{call_db_id}`
+5. Bridge relays mulaw audio between Twilio Media Streams and Deepgram Voice Agent API
+6. Compliance officer talks to the AI agent about the PHI event
+7. Officer can say "mark as mitigated" or "mark as resolved" — agent updates the event via function calling
 
 | Component | Stack | Port |
 |-----------|-------|------|
-| Proxy | mitmproxy + Python addon | 8080 |
+| Proxy | mitmproxy + Python addon (Presidio NLP) | 8080 |
 | Backend | FastAPI, PostgreSQL 14, psycopg2 | 8000 |
 | Dashboard | React 18, Vite, D3.js, TailwindCSS | 3000 |
-| Voice Alerts | VAPI + GPT-5.2 + ElevenLabs | - |
+| Voice Alerts | Twilio + Deepgram Voice Agent + GPT-4o-mini | - |
 
 ---
 
 ## Quick Start
 
-### 1. Start the backend + dashboard + database
+### One-command setup (macOS)
+
+```bash
+bash setup.sh
+```
+
+This will:
+- Install prerequisites (mitmproxy, cloudflared)
+- Trust the mitmproxy CA certificate
+- Build and start Docker containers
+- Seed the database with demo events
+- Start the mitmproxy interception proxy
+- Launch a proxied Chrome window with the dashboard
+
+### Manual setup
+
+#### 1. Start the backend + dashboard + database
 
 ```bash
 docker compose up --build
 ```
 
-This starts PostgreSQL, the FastAPI backend, and the React dashboard.
-
-### 2. Seed demo data
+#### 2. Seed demo data
 
 ```bash
 curl -X POST http://localhost:8000/api/seed
 ```
 
-### 3. Open the dashboard
+#### 3. Open the dashboard
 
 Navigate to [http://localhost:3000](http://localhost:3000)
 
-### 4. Start the proxy (separate terminal)
+#### 4. Start the proxy (separate terminal)
 
 ```bash
-# Run mitmproxy with the MediProxy AI addon
-mitmproxy -s shadowguard_addon.py
+mitmdump -s shadowguard_addon.py --listen-port 8080 --set block_global=false --set stream_large_bodies=1m
 ```
 
-### 5. Route traffic through the proxy
+#### 5. Launch a proxied Chrome
 
 ```bash
-export HTTPS_PROXY=http://localhost:8080
-export HTTP_PROXY=http://localhost:8080
-export SSL_CERT_FILE=~/.mitmproxy/mitmproxy-ca-cert.pem
-```
-
-Or launch a proxied Chrome:
-
-```bash
-# macOS
-open -na "Google Chrome" --args \
-  --proxy-server="http://localhost:8080" \
-  --user-data-dir="/tmp/chrome-proxy-test"
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --proxy-server='http://localhost:8080' \
+  --user-data-dir=/tmp/mediproxy-chrome \
+  --no-first-run \
+  "http://localhost:3000"
 ```
 
 ---
 
-## VAPI Voice Alerts
+## Twilio Voice Alerts + Deepgram Voice Agent
 
-When a high-risk PHI exposure is detected (severity critical/high, risk score >= 70), MediProxy AI can automatically call the responsible staff via VAPI to notify them.
+When a high-risk PHI exposure is detected, MediProxy automatically calls the compliance officer via Twilio. The call connects to a Deepgram-powered AI voice agent that:
 
-### Setup
+- Briefs the officer on the PHI event (service, PHI types, risk score, severity, patient name if detected)
+- Answers questions about the event details
+- Can mark the event as "mitigated" or "resolved" via voice commands (with confirmation)
+- Updates the dashboard in real-time via WebSocket broadcast
 
-1. Create a VAPI account at [vapi.ai](https://vapi.ai)
-2. Configure a phone number and an assistant on the VAPI dashboard
-3. The assistant should use template variables: `{{service}}`, `{{phi_types}}`, `{{risk_score}}`, `{{action_taken}}`, `{{timestamp}}`, `{{department}}`
-4. Add your credentials to `.env`:
+### Twilio Setup
 
-```env
-VAPI_ENABLED=true
-VAPI_API_KEY=your-private-key
-VAPI_PHONE_NUMBER_ID=your-vapi-phone-id
-VAPI_ASSISTANT_ID=your-assistant-id
-ALERT_PHONE_NUMBER=+1XXXXXXXXXX
-CALL_COOLDOWN_SECONDS=300
+1. Sign up at [console.twilio.com](https://console.twilio.com)
+2. Get your Account SID and Auth Token from the dashboard
+3. Buy a phone number with Voice capability
+4. If on a trial account, verify the phone number you want to call under Phone Numbers → Verified Caller IDs
+
+### Deepgram Setup
+
+1. Sign up at [deepgram.com](https://deepgram.com)
+2. Create an API key from the console
+
+### Tunnel Setup (for local development)
+
+Twilio needs to reach your local backend. Use cloudflared:
+
+```bash
+cloudflared tunnel --url http://localhost:8000
 ```
 
-### How it works
+Copy the generated URL hostname (e.g., `something.trycloudflare.com`) into your `.env` as `SERVICE_HOST`.
 
-- Calls are **only triggered** when `VAPI_ENABLED=true` — safe to run without it
-- Seeding demo data does **not** trigger real calls (only inserts fake call records)
-- Per-IP cooldown prevents call spam (default: 5 minutes)
-- Test a call manually: `curl -X POST http://localhost:8000/api/calls/test`
+### Configuration
+
+Add to `.env`:
+
+```env
+TELEPHONY_ENABLED=true
+TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_AUTH_TOKEN=your_auth_token
+TWILIO_PHONE_NUMBER=+1XXXXXXXXXX
+ALERT_PHONE_NUMBER=+1XXXXXXXXXX
+CALL_COOLDOWN_SECONDS=300
+DEEPGRAM_API_KEY=your_deepgram_api_key
+SERVICE_HOST=your-tunnel-hostname.trycloudflare.com
+```
+
+### Test a call
+
+```bash
+curl -X POST http://localhost:8000/api/calls/test
+```
+
+You'll hear:
+1. Twilio trial disclaimer (press any key)
+2. "Please hold, connecting you to the MediProxy compliance agent."
+3. The Deepgram voice agent briefs you on the PHI event
+4. Say "mark as mitigated" or "resolve this event" to update status
 
 ---
 
@@ -114,12 +162,14 @@ CALL_COOLDOWN_SECONDS=300
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `DATABASE_URL` | Yes (Docker sets it) | `postgresql://shadowguard:shadowguard@localhost:5432/shadowguard` | PostgreSQL connection string |
-| `VAPI_ENABLED` | No | `false` | Enable voice call alerts |
-| `VAPI_API_KEY` | For calls | - | VAPI private API key |
-| `VAPI_PHONE_NUMBER_ID` | For calls | - | VAPI phone number ID |
-| `VAPI_ASSISTANT_ID` | For calls | - | Pre-configured VAPI assistant ID |
+| `TELEPHONY_ENABLED` | No | `false` | Enable Twilio voice call alerts |
+| `TWILIO_ACCOUNT_SID` | For calls | - | Twilio account SID |
+| `TWILIO_AUTH_TOKEN` | For calls | - | Twilio auth token |
+| `TWILIO_PHONE_NUMBER` | For calls | - | Your Twilio phone number (caller ID) |
 | `ALERT_PHONE_NUMBER` | For calls | - | Phone number to receive alert calls |
 | `CALL_COOLDOWN_SECONDS` | No | `300` | Minimum seconds between calls per source IP |
+| `DEEPGRAM_API_KEY` | For voice agent | - | Deepgram API key for the voice agent |
+| `SERVICE_HOST` | For calls | `localhost` | Hostname for Twilio TwiML/WebSocket URLs (set to your tunnel URL) |
 
 ---
 
@@ -134,37 +184,37 @@ CALL_COOLDOWN_SECONDS=300
 | `PATCH` | `/api/events/:id/status` | Update event status (active/mitigated/resolved) |
 | `GET` | `/api/stats` | Dashboard aggregate statistics |
 | `POST` | `/api/seed` | Seed database with demo data |
-| `GET` | `/api/calls` | List VAPI call records |
+| `GET` | `/api/calls` | List call records |
 | `GET` | `/api/calls/stats` | Voice call aggregate stats |
-| `POST` | `/api/calls/test` | Trigger a test VAPI call |
-| `WS` | `/api/ws` | WebSocket for real-time updates |
+| `POST` | `/api/calls/test` | Trigger a test call |
+| `GET/POST` | `/api/twiml/:id` | TwiML endpoint for Twilio (returns XML with `<Say>` + `<Connect><Stream>`) |
+| `WS` | `/api/voice-agent/:id` | WebSocket bridge: Twilio Media Streams ↔ Deepgram Voice Agent |
+| `WS` | `/api/ws` | WebSocket for real-time dashboard updates |
 
 ---
 
 ## Testing Interception
 
-### Terminal test (with proxy running)
+### Browser test (recommended)
+
+1. Run `bash setup.sh` or start the proxy manually
+2. In the proxied Chrome, go to [chatgpt.com](https://chatgpt.com)
+3. Type a message containing PHI: "Summarize notes for patient John Doe, SSN 423-91-8847, DOB 03/15/1958"
+4. Watch the dashboard update in real-time
+5. If the event is high-risk, your phone rings with the voice agent
+
+### Terminal test
 
 ```bash
-# Clean request (no PHI) — should be logged
-curl -X POST https://api.openai.com/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-fake-test-key" \
-  -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "How do I sort a list in Python?"}]}'
+export HTTPS_PROXY=http://localhost:8080
+export SSL_CERT_FILE=~/.mitmproxy/mitmproxy-ca-cert.pem
 
-# PHI request — should be detected and redacted
+# PHI request — detected and redacted
 curl -X POST https://api.openai.com/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-fake-test-key" \
-  -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Summarize notes for patient John Doe, SSN: 423-91-8847, DOB: 03/15/1958. Diagnosis E11.9 Type 2 Diabetes."}]}'
+  -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Patient John Doe, SSN: 423-91-8847, DOB: 03/15/1958. Diagnosis E11.9 Type 2 Diabetes."}]}'
 ```
-
-### Browser test
-
-1. Launch Chrome with proxy: `--proxy-server="http://localhost:8080"`
-2. Navigate to `http://mitm.it` and install the mitmproxy CA certificate
-3. Go to `https://chatgpt.com` and type a message
-4. Watch the dashboard update in real-time
 
 ---
 
@@ -174,31 +224,27 @@ curl -X POST https://api.openai.com/v1/chat/completions \
 MediProxy-AI/
 ├── shadowguard_addon.py    # mitmproxy addon — intercepts, detects PHI, posts to backend
 ├── phi_redactor.py         # PHI detection engine (Presidio + regex fallback)
+├── setup.sh                # One-command setup script
 ├── docker-compose.yml      # PostgreSQL + backend + dashboard
-├── .env                    # VAPI and other environment variables
+├── .env                    # Twilio, Deepgram, and other config
 ├── backend/
-│   ├── main.py             # FastAPI app, routes, WebSocket manager
+│   ├── main.py             # FastAPI app, TwiML endpoint, voice agent bridge, routes
 │   ├── database.py         # PostgreSQL connection pool, table creation
 │   ├── models.py           # Pydantic request/response models
 │   ├── seed.py             # Demo data generator
-│   ├── vapi_caller.py      # VAPI voice call integration
+│   ├── vapi_caller.py      # Twilio call creation, cooldown logic
+│   ├── deepgram_agent.py   # Deepgram Voice Agent config, WebSocket connection
 │   ├── requirements.txt    # Python dependencies
-│   └── Dockerfile
+│   ├── Dockerfile
+│   └── tests/
+│       ├── test_voice_agent_unit.py              # Unit tests
+│       └── test_twilio_migration_properties.py   # Property-based tests (Hypothesis)
 └── dashboard/
     ├── src/
-    │   ├── App.jsx         # Main app with state management + WebSocket
-    │   ├── components/
-    │   │   ├── StatsCards.jsx       # Summary stat cards
-    │   │   ├── ThreatFeed.jsx       # Live threat feed sidebar
-    │   │   ├── TrafficTimeline.jsx  # D3 traffic timeline chart
-    │   │   ├── RiskHeatmap.jsx      # D3 risk heatmap
-    │   │   ├── NetworkGraph.jsx     # D3 force-directed network graph
-    │   │   ├── AuditLog.jsx         # Sortable/paginated audit table
-    │   │   └── RedactionViewer.jsx  # Side-by-side original/redacted modal
-    │   ├── hooks/
-    │   │   └── useWebSocket.js      # WebSocket hook with auto-reconnect
-    │   └── lib/
-    │       └── api.js               # REST API client functions
+    │   ├── App.jsx
+    │   ├── components/     # StatsCards, ThreatFeed, TrafficTimeline, RiskHeatmap, etc.
+    │   ├── hooks/          # useWebSocket with auto-reconnect
+    │   └── lib/            # REST API client
     ├── package.json
     └── Dockerfile
 ```
@@ -207,17 +253,21 @@ MediProxy-AI/
 
 ## Troubleshooting
 
-**"SSL certificate verify failed"**
-Install/trust the mitmproxy CA cert: `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.mitmproxy/mitmproxy-ca-cert.pem`
+**"SSL certificate verify failed" in proxied Chrome**
+Trust the mitmproxy CA cert: `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.mitmproxy/mitmproxy-ca-cert.pem`
+Or visit `http://mitm.it` in the proxied browser and install the cert.
 
-**"Connection refused" on port 8000**
-Make sure `docker compose up` is running and the backend container is healthy.
+**Twilio call says "press any key" then "we are sorry, goodbye"**
+Twilio can't reach your TwiML endpoint. Make sure cloudflared is running, `SERVICE_HOST` in `.env` matches the tunnel URL, and you restarted the backend after changing it.
 
-**VAPI calls failing with 403**
-Ensure `User-Agent` header is set (already handled in code). Check your VAPI API key is the **private** key, not the public one.
+**Twilio call connects but voice agent is silent**
+Check `docker compose logs backend` for Deepgram errors. Common causes: invalid `DEEPGRAM_API_KEY`, or the Deepgram WebSocket connection failed.
 
-**VAPI calls failing with SSL errors**
-The backend Docker container disables SSL verification for outbound VAPI calls to avoid certificate issues with proxies.
+**"No event found for call_db_id"**
+The test call endpoint creates a real event now. If you see this, seed the database first: `curl -X POST http://localhost:8000/api/seed`
 
 **Dashboard not updating**
 Check the WebSocket connection indicator in the header. The dashboard auto-reconnects if the connection drops.
+
+**Proxy browser is slow**
+mitmproxy decrypts all HTTPS traffic. The addon only scans AI service domains, but TLS interception adds overhead to every connection.

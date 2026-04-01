@@ -1,5 +1,5 @@
 """
-ShadowGuard - mitmproxy Addon
+Mediproxy- mitmproxy Addon
 Intercepts HTTPS traffic to AI services and detects PHI.
 
 Usage:
