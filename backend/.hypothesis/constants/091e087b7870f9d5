@@ -1,0 +1,4 @@
+# file: /Users/venkatnikhilm/MyStuff/ShadowGuard/backend/vapi_caller.py
+# hypothesis_version: 6.151.10
+
+[500, ', ', '127.0.0.1', '300', 'ALERT_PHONE_NUMBER', 'SERVICE_HOST', 'TELEPHONY_ENABLED', 'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE_NUMBER', 'call_id', 'cnt', 'critical', 'data', 'event_id', 'false', 'high', 'http', 'https', 'id', 'localhost', 'mediproxy.connect', 'phi_types', 'phone_number', 'prepare', 'queued', 'request_path', 'risk_score', 'sentinel', 'severity', 'source_ip', 'status', 'telemetry', 'true', 'type', 'voice_call']

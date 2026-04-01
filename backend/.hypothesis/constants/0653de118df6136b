@@ -1,0 +1,4 @@
+# file: /Users/venkatnikhilm/MyStuff/ShadowGuard/backend/database.py
+# hypothesis_version: 6.151.10
+
+['/', '5432', ':', '@', 'DATABASE_URL', 'cursor_factory', 'dbname', 'host', 'password', 'port', 'postgresql://', 'user']

@@ -1,40 +1,48 @@
 """
-VAPI Voice Call integration for ShadowGuard.
-Triggers automated phone calls for high-risk PHI exposure events
-using a pre-configured VAPI assistant with GPT-5.2 + ElevenLabs.
+Twilio Voice Alert integration for ShadowGuard.
+Triggers automated outbound phone calls for high-risk PHI exposure events
+using Twilio REST API + Media Streams for bidirectional WebSocket audio.
+
+Environment variables:
+  TELEPHONY_ENABLED=true
+  TWILIO_ACCOUNT_SID=...
+  TWILIO_AUTH_TOKEN=...
+  TWILIO_PHONE_NUMBER=+1XXXXXXXXXX   (your Twilio number)
+  ALERT_PHONE_NUMBER=+1XXXXXXXXXX    (number to call)
+  CALL_COOLDOWN_SECONDS=300
+  SERVICE_HOST=your-domain.com
 """
 
 import os
-import ssl
 import threading
 import logging
 from datetime import datetime, timezone, timedelta
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
 import json
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from database import get_cursor, dict_cursor
 
-logger = logging.getLogger("shadowguard.vapi")
+logger = logging.getLogger("mediproxy.connect")
 
 # ── Configuration ──────────────────────────────────────────
-VAPI_ENABLED = os.getenv("VAPI_ENABLED", "false").lower() == "true"
-VAPI_API_KEY = os.getenv("VAPI_API_KEY", "")
-VAPI_PHONE_NUMBER_ID = os.getenv("VAPI_PHONE_NUMBER_ID", "")
-VAPI_ASSISTANT_ID = os.getenv("VAPI_ASSISTANT_ID", "")
-ALERT_PHONE_NUMBER = os.getenv("ALERT_PHONE_NUMBER", "")
-CALL_COOLDOWN_SECONDS = int(os.getenv("CALL_COOLDOWN_SECONDS", "300"))
-
-VAPI_API_URL = "https://api.vapi.ai/call"
+TELEPHONY_ENABLED       = os.getenv("TELEPHONY_ENABLED", "false").lower() == "true"
+TWILIO_ACCOUNT_SID      = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN        = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_PHONE_NUMBER     = os.getenv("TWILIO_PHONE_NUMBER", "")
+ALERT_PHONE_NUMBER      = os.getenv("ALERT_PHONE_NUMBER", "")
+CALL_COOLDOWN_SECONDS   = int(os.getenv("CALL_COOLDOWN_SECONDS", "300"))
+SERVICE_HOST            = os.getenv("SERVICE_HOST", "localhost")
 
 
 def is_configured() -> bool:
-    """Check if VAPI is enabled and all required env vars are set."""
+    """Check if Twilio telephony is enabled and all required env vars are set."""
     return bool(
-        VAPI_ENABLED
-        and VAPI_API_KEY
-        and VAPI_PHONE_NUMBER_ID
-        and VAPI_ASSISTANT_ID
+        TELEPHONY_ENABLED
+        and TWILIO_ACCOUNT_SID
+        and TWILIO_AUTH_TOKEN
+        and TWILIO_PHONE_NUMBER
         and ALERT_PHONE_NUMBER
     )
 
@@ -63,83 +71,47 @@ def _extract_phi_list(event_data: dict) -> str:
 
 def _make_vapi_call(call_db_id: int, event_data: dict, broadcast_fn=None):
     """
-    Synchronous function that calls VAPI API and updates the call record.
-    Designed to run in a background thread. The call record is already
-    inserted before this runs (to prevent race conditions).
+    Place an outbound call via Twilio REST API.
+    Runs in a background thread. Call record already inserted before this runs.
     """
-    event_id = event_data.get("event_id")
-    phone = ALERT_PHONE_NUMBER
+    from twilio.rest import Client
 
-    # Use the pre-configured VAPI assistant with variable overrides
-    payload = {
-        "phoneNumberId": VAPI_PHONE_NUMBER_ID,
-        "assistantId": VAPI_ASSISTANT_ID,
-        "assistantOverrides": {
-            "variableValues": {
-                "service": event_data.get("ai_service", "an AI service"),
-                "phi_types": _extract_phi_list(event_data),
-                "risk_score": str(event_data.get("risk_score", 0)),
-                "action_taken": "redacted and forwarded",
-                "timestamp": event_data.get("timestamp", ""),
-                "department": "unknown",
-            },
-        },
-        "customer": {"number": phone},
-    }
+    event_id = event_data.get("event_id")
 
     try:
-        req = Request(
-            VAPI_API_URL,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {VAPI_API_KEY}",
-                "Content-Type": "application/json",
-                "User-Agent": "ShadowGuard/1.0",
-            },
-            method="POST",
+        # Construct TwiML URL (http for local dev, https for production)
+        scheme = "http" if SERVICE_HOST in ("localhost", "127.0.0.1") else "https"
+        twiml_url = f"{scheme}://{SERVICE_HOST}/api/twiml/{call_db_id}"
+
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        call = client.calls.create(
+            to=ALERT_PHONE_NUMBER,
+            from_=TWILIO_PHONE_NUMBER,
+            url=twiml_url,
         )
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
-        with urlopen(req, timeout=10, context=ssl_ctx) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-            vapi_call_id = body.get("id", "")
+
+        logger.info("Twilio call initiated: %s for event %s", call.sid, event_id)
 
         with get_cursor() as cur:
             cur.execute(
                 "UPDATE vapi_calls SET call_id = %s, status = 'queued' WHERE id = %s",
-                (vapi_call_id, call_db_id),
+                (call.sid, call_db_id),
             )
-
-        logger.info("VAPI call initiated: %s for event %s", vapi_call_id, event_id)
 
         if broadcast_fn:
             broadcast_fn({
                 "type": "voice_call",
                 "data": {
                     "event_id": str(event_id),
-                    "call_id": vapi_call_id,
+                    "call_id": call.sid,
                     "status": "queued",
-                    "phone_number": phone,
+                    "phone_number": ALERT_PHONE_NUMBER,
                 },
             })
 
-    except HTTPError as e:
-        body_text = ""
-        try:
-            body_text = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        error_msg = f"HTTP {e.code}: {body_text[:500]}"
-        logger.error("VAPI call failed for event %s: %s", event_id, error_msg)
-        with get_cursor() as cur:
-            cur.execute(
-                "UPDATE vapi_calls SET status = 'failed', error_message = %s WHERE id = %s",
-                (error_msg, call_db_id),
-            )
-    except URLError as e:
+    except Exception as e:
         error_msg = str(e)[:500]
-        logger.error("VAPI call failed for event %s: %s", event_id, error_msg)
+        logger.error("Twilio call failed for event %s: %s", event_id, error_msg)
         with get_cursor() as cur:
             cur.execute(
                 "UPDATE vapi_calls SET status = 'failed', error_message = %s WHERE id = %s",
@@ -149,12 +121,8 @@ def _make_vapi_call(call_db_id: int, event_data: dict, broadcast_fn=None):
 
 def maybe_trigger_call(event_data: dict, broadcast_fn=None):
     """
-    Check if the event warrants a VAPI call and trigger it in a background thread.
+    Check if the event warrants a call and trigger it in a background thread.
     Called from create_event in main.py.
-
-    The call record is inserted synchronously BEFORE starting the thread,
-    so that rapid duplicate requests (e.g. ChatGPT sending prepare + submit
-    + response within milliseconds) are caught by the cooldown check.
     """
     if not is_configured():
         return
@@ -165,24 +133,22 @@ def maybe_trigger_call(event_data: dict, broadcast_fn=None):
     if severity not in ("critical", "high") or risk_score < 70:
         return
 
-    # Skip pre-submit requests (e.g. ChatGPT's /conversation/prepare)
+    # Skip background/telemetry requests
     request_path = event_data.get("request_path", "")
-    if "prepare" in request_path or "telemetry" in request_path or "sentinel" in request_path:
+    if any(x in request_path for x in ("prepare", "telemetry", "sentinel")):
         return
 
     source_ip = event_data.get("source_ip", "")
     if _check_cooldown(source_ip):
         return
 
-    # Insert the call record NOW (synchronously) so the next request
-    # within milliseconds will see it in the cooldown check
+    # Insert call record synchronously to block duplicate calls
     event_id = event_data.get("event_id")
-    phone = ALERT_PHONE_NUMBER
     with get_cursor(cursor_factory=dict_cursor()) as cur:
         cur.execute(
             "INSERT INTO vapi_calls (event_id, source_ip, phone_number, status) "
             "VALUES (%s, %s, %s, 'initiated') RETURNING id",
-            (event_id, source_ip, phone),
+            (event_id, source_ip, ALERT_PHONE_NUMBER),
         )
         call_db_id = cur.fetchone()["id"]
 

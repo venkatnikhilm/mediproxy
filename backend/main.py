@@ -6,17 +6,26 @@ Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 
 import asyncio
+import base64
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+import logging
+import os
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.websockets import WebSocketState
 
 from database import init_db, get_cursor, dict_cursor, close_pool
 from models import EventCreate, EventResponse, StatusUpdate, StatsResponse
 from seed import generate_seed_events, insert_seed_events
-from vapi_caller import maybe_trigger_call, is_configured as vapi_is_configured, _make_vapi_call, ALERT_PHONE_NUMBER
+from vapi_caller import maybe_trigger_call, is_configured as vapi_is_configured, _make_vapi_call, ALERT_PHONE_NUMBER, SERVICE_HOST
+from deepgram_agent import build_settings, connect_to_deepgram
+
+voice_logger = logging.getLogger("shadowguard.voice_agent")
 
 
 # ============================================================
@@ -412,24 +421,65 @@ def get_call_stats():
     }
 
 
+@app.api_route("/api/twiml/{call_db_id}", methods=["GET", "POST"])
+def twiml_endpoint(call_db_id: int):
+    """Return TwiML XML instructing Twilio to stream audio to the voice agent bridge."""
+    host = SERVICE_HOST or "localhost"
+    scheme = "ws" if host in ("localhost", "127.0.0.1") else "wss"
+    stream_url = f"{scheme}://{host}/api/voice-agent/{call_db_id}"
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        "<Say>Please hold, connecting you to the ShadowGuard compliance agent.</Say>"
+        "<Connect>"
+        f'<Stream url="{stream_url}" />'
+        "</Connect>"
+        "</Response>"
+    )
+    return Response(content=xml, media_type="application/xml")
+
+
 @app.post("/api/calls/test")
 def trigger_test_call():
-    """Manually trigger a test VAPI call (for demo)."""
+    """Manually trigger a test Twilio call (for demo)."""
     if not vapi_is_configured():
         raise HTTPException(
             status_code=503,
-            detail="VAPI not configured. Set VAPI_ENABLED=true, VAPI_API_KEY, VAPI_PHONE_NUMBER_ID, VAPI_ASSISTANT_ID, ALERT_PHONE_NUMBER.",
+            detail="Telephony not configured. Set TELEPHONY_ENABLED=true, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, ALERT_PHONE_NUMBER.",
         )
 
-    test_event = {
-        "event_id": "00000000-0000-0000-0000-000000000000",
-        "source_ip": "10.0.10.1",
-        "ai_service": "ChatGPT",
-        "risk_score": 95,
-        "severity": "critical",
-        "phi_types": ["PERSON", "US_SSN", "DATE_OF_BIRTH"],
-    }
-    # Insert call record synchronously, then fire the API call in a thread
+    # Insert a real test event so the bridge can look it up
+    with get_cursor(cursor_factory=dict_cursor()) as cur:
+        cur.execute(
+            """
+            INSERT INTO events (
+                source_ip, user_agent, ai_service, request_method, request_path,
+                risk_score, severity, phi_detected, phi_count,
+                phi_types, phi_findings, original_text, redacted_text,
+                action, engine, response_time_ms
+            ) VALUES (
+                '10.0.10.1', 'TestAgent/1.0', 'ChatGPT', 'POST', '/v1/chat/completions',
+                95, 'critical', TRUE, 3,
+                %s, %s, 'Patient John Doe SSN 123-45-6789 DOB 01/15/1980',
+                'Patient [PERSON] SSN [US_SSN] DOB [DATE_OF_BIRTH]',
+                'redacted', 'presidio', 42
+            )
+            RETURNING *
+            """,
+            (
+                json.dumps(["PERSON", "US_SSN", "DATE_OF_BIRTH"]),
+                json.dumps([
+                    {"type": "PERSON", "value": "[REDACTED]"},
+                    {"type": "US_SSN", "value": "[REDACTED]"},
+                    {"type": "DATE_OF_BIRTH", "value": "[REDACTED]"},
+                ]),
+            ),
+        )
+        event_row = cur.fetchone()
+
+    test_event = _row_to_dict(event_row)
+
+    # Insert call record linked to the real event
     with get_cursor(cursor_factory=dict_cursor()) as cur:
         cur.execute(
             "INSERT INTO vapi_calls (event_id, source_ip, phone_number, status) "
@@ -446,6 +496,260 @@ def trigger_test_call():
     )
     thread.start()
     return {"message": "Test call triggered", "phone": ALERT_PHONE_NUMBER}
+
+
+# ============================================================
+# Voice Agent Bridge
+# ============================================================
+
+async def _relay_twilio_to_deepgram(websocket: WebSocket, deepgram_ws, state: dict):
+    """Forward audio from Twilio Media Stream → Deepgram."""
+    try:
+        while True:
+            raw_text = await websocket.receive_text()
+            try:
+                msg = json.loads(raw_text)
+            except (json.JSONDecodeError, TypeError):
+                voice_logger.warning("Invalid JSON from Twilio, skipping")
+                continue
+
+            event = msg.get("event")
+            if event == "start":
+                state["stream_sid"] = msg["start"]["streamSid"]
+                voice_logger.info("Twilio stream started: streamSid=%s", state["stream_sid"])
+            elif event == "media":
+                payload = msg["media"]["payload"]
+                audio_bytes = base64.b64decode(payload)
+                await deepgram_ws.send(audio_bytes)
+            elif event == "stop":
+                voice_logger.info("Twilio stream stopped")
+                break
+    except WebSocketDisconnect:
+        voice_logger.info("Twilio WebSocket disconnected")
+    except Exception as exc:
+        voice_logger.error("Twilio→Deepgram relay error: %s", exc)
+
+
+async def _relay_deepgram_to_twilio(
+    websocket: WebSocket,
+    deepgram_ws,
+    event_id: str,
+    broadcast_fn,
+    state: dict,
+):
+    """Forward audio from Deepgram → Twilio Media Stream and handle function calls."""
+    try:
+        async for raw in deepgram_ws:
+            # Binary frames are audio — base64-encode and wrap in Twilio Media Stream JSON
+            if isinstance(raw, bytes):
+                media_msg = {
+                    "event": "media",
+                    "streamSid": state.get("stream_sid", ""),
+                    "media": {
+                        "payload": base64.b64encode(raw).decode("ascii"),
+                    },
+                }
+                await websocket.send_text(json.dumps(media_msg))
+                continue
+
+            # Text frames are JSON control messages
+            try:
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+            msg_type = msg.get("type", "")
+            voice_logger.info("Deepgram message: type=%s", msg_type)
+
+            if msg_type == "Error":
+                voice_logger.error("Deepgram error: %s", msg.get("description", msg))
+                continue
+
+            if msg_type == "Warning":
+                voice_logger.warning("Deepgram warning: %s", msg.get("description", msg))
+                continue
+
+            if msg_type != "FunctionCallRequest":
+                continue
+
+            # New API format: functions is a list of function call objects
+            functions = msg.get("functions", [])
+            for fn in functions:
+                fn_name = fn.get("name", "")
+                fn_call_id = fn.get("id", "")
+
+                status_map = {
+                    "mark_mitigated": "mitigated",
+                    "mark_resolved": "resolved",
+                }
+                new_status = status_map.get(fn_name)
+                if new_status is None:
+                    continue
+
+                # Execute the status PATCH against our own API
+                result_text = await _patch_event_status(event_id, new_status, broadcast_fn)
+
+                # Send FunctionCallResponse back to Deepgram
+                response_msg = {
+                    "type": "FunctionCallResponse",
+                    "id": fn_call_id,
+                    "name": fn_name,
+                    "content": result_text,
+                }
+                await deepgram_ws.send(json.dumps(response_msg))
+
+    except WebSocketDisconnect:
+        voice_logger.info("Twilio WebSocket disconnected during Deepgram relay")
+    except Exception as exc:
+        voice_logger.error("Deepgram→Twilio relay error: %s", exc)
+
+
+async def _patch_event_status(event_id: str, new_status: str, broadcast_fn) -> str:
+    """Call PATCH /api/events/{event_id}/status internally and broadcast on success."""
+    try:
+        with get_cursor(cursor_factory=dict_cursor()) as cur:
+            cur.execute(
+                "UPDATE events SET status = %s WHERE event_id = %s RETURNING event_id",
+                (new_status, event_id),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            error_text = f"Event {event_id} not found. Please update the status manually on the dashboard."
+            voice_logger.error("Status PATCH failed: event %s not found", event_id)
+            return error_text
+
+        # Broadcast to dashboard clients
+        if broadcast_fn:
+            broadcast_fn({
+                "type": "status_update",
+                "data": {"event_id": event_id, "status": new_status},
+            })
+
+        return f"Event successfully marked as {new_status}."
+
+    except Exception as exc:
+        error_text = f"Could not update status: {exc}. Please update the status manually on the dashboard."
+        voice_logger.error("Status PATCH error for event %s: %s", event_id, exc)
+        return error_text
+
+
+async def _finalize_call(call_db_id: int, status: str, started_at: datetime):
+    """Update the vapi_calls record with final status and duration."""
+    now = datetime.now(timezone.utc)
+    duration = int((now - started_at).total_seconds()) if status == "completed" else None
+    try:
+        with get_cursor() as cur:
+            cur.execute(
+                "UPDATE vapi_calls SET status = %s, ended_at = %s, duration_seconds = %s WHERE id = %s",
+                (status, now, duration, call_db_id),
+            )
+        voice_logger.info("Call %d finalized: status=%s duration=%s", call_db_id, status, duration)
+    except Exception as exc:
+        voice_logger.error("Failed to finalize call %d: %s", call_db_id, exc)
+
+
+@app.websocket("/api/voice-agent/{call_db_id}")
+async def voice_agent_bridge(websocket: WebSocket, call_db_id: int):
+    """Bridge audio between Twilio Media Stream and Deepgram Voice Agent."""
+    await websocket.accept()
+    started_at = datetime.now(timezone.utc)
+
+    # Validate DEEPGRAM_API_KEY
+    api_key = os.environ.get("DEEPGRAM_API_KEY", "")
+    if not api_key:
+        voice_logger.error("DEEPGRAM_API_KEY not set — closing with 1008")
+        await websocket.close(code=1008, reason="DEEPGRAM_API_KEY not configured")
+        await _finalize_call(call_db_id, "failed", started_at)
+        return
+
+    # Fetch PHI event data via call_db_id → event_id
+    try:
+        with get_cursor(cursor_factory=dict_cursor()) as cur:
+            cur.execute(
+                "SELECT e.* FROM events e "
+                "JOIN vapi_calls vc ON vc.event_id = e.event_id "
+                "WHERE vc.id = %s",
+                (call_db_id,),
+            )
+            event_row = cur.fetchone()
+    except Exception as exc:
+        voice_logger.error("DB lookup failed for call %d: %s", call_db_id, exc)
+        await websocket.close(code=1011, reason="Database error")
+        await _finalize_call(call_db_id, "failed", started_at)
+        return
+
+    if not event_row:
+        voice_logger.error("No event found for call_db_id %d", call_db_id)
+        await websocket.close(code=1008, reason="Event not found")
+        await _finalize_call(call_db_id, "failed", started_at)
+        return
+
+    event_data = _row_to_dict(event_row)
+    event_id = event_data["event_id"]
+
+    # Connect to Deepgram
+    deepgram_ws = None
+    final_status = "completed"
+    try:
+        deepgram_ws = await connect_to_deepgram(api_key)
+
+        # Send SettingsConfiguration
+        settings = build_settings(event_data)
+        await deepgram_ws.send(json.dumps(settings))
+
+        # Shared state for Twilio streamSid
+        state = {"stream_sid": None}
+
+        # Run bidirectional relay
+        twilio_to_dg = asyncio.create_task(
+            _relay_twilio_to_deepgram(websocket, deepgram_ws, state)
+        )
+        dg_to_twilio = asyncio.create_task(
+            _relay_deepgram_to_twilio(websocket, deepgram_ws, event_id, broadcast_from_thread, state)
+        )
+
+        # Wait for either side to finish
+        done, pending = await asyncio.wait(
+            [twilio_to_dg, dg_to_twilio],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # Cancel the remaining task
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Check if any completed task raised an unexpected error
+        for task in done:
+            exc = task.exception()
+            if exc is not None:
+                voice_logger.error("Relay task error: %s", exc)
+                final_status = "failed"
+
+    except Exception as exc:
+        voice_logger.error("Voice agent bridge error for call %d: %s", call_db_id, exc)
+        final_status = "failed"
+
+    finally:
+        # Close Deepgram WebSocket
+        if deepgram_ws is not None:
+            try:
+                await deepgram_ws.close()
+            except Exception:
+                pass
+
+        # Close Twilio WebSocket
+        if websocket.client_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
+        await _finalize_call(call_db_id, final_status, started_at)
 
 
 # ============================================================

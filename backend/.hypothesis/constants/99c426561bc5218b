@@ -1,0 +1,4 @@
+# file: /Users/venkatnikhilm/MyStuff/ShadowGuard/backend/deepgram_agent.py
+# hypothesis_version: 6.151.10
+
+[8000, 48000, ', ', 'Authorization', 'N/A', 'agent', 'ai_service', 'audio', 'aura-asteria-en', 'bitrate', 'description', 'encoding', 'functions', 'gpt-4o-mini', 'input', 'instructions', 'listen', 'mark_mitigated', 'mark_resolved', 'model', 'mulaw', 'name', 'nova-2', 'object', 'open_ai', 'output', 'parameters', 'phi_types', 'properties', 'provider', 'redacted_text', 'required', 'risk_score', 'sample_rate', 'severity', 'source_ip', 'speak', 'think', 'timestamp', 'type', 'unknown', 'unknown service']

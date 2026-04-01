@@ -32,20 +32,24 @@ logger = logging.getLogger("shadowguard.phi")
 PRESIDIO_AVAILABLE = False
 
 try:
-    from presidio_analyzer import (
-        AnalyzerEngine,
-        PatternRecognizer,
-        Pattern,
-        RecognizerResult,
-    )
-    from presidio_anonymizer import AnonymizerEngine
-    from presidio_anonymizer.entities import OperatorConfig
-
-    PRESIDIO_AVAILABLE = True
-    logger.info("Presidio loaded successfully")
-except ImportError:
+    # Only attempt import if explicitly needed — skip if spacy/numpy have conflicts
+    import importlib.util
+    if importlib.util.find_spec("presidio_analyzer") and importlib.util.find_spec("spacy"):
+        from presidio_analyzer import (
+            AnalyzerEngine,
+            PatternRecognizer,
+            Pattern,
+            RecognizerResult,
+        )
+        from presidio_anonymizer import AnonymizerEngine
+        from presidio_anonymizer.entities import OperatorConfig
+        PRESIDIO_AVAILABLE = True
+        logger.info("Presidio loaded successfully")
+    else:
+        logger.info("Presidio not found — using regex-based detection")
+except Exception as e:
     logger.warning(
-        "Presidio not installed — falling back to regex-based detection. "
+        f"Presidio unavailable ({e}) — falling back to regex-based detection. "
         "Install with: pip install presidio-analyzer presidio-anonymizer && "
         "python -m spacy download en_core_web_lg"
     )

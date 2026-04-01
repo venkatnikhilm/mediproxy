@@ -1,4 +1,5 @@
-version: '3.8'
+name: mediproxy
+
 services:
   postgres:
     image: postgres:14.20
@@ -23,14 +24,27 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # environment:
+    #   DATABASE_URL: postgresql://shadowguard:shadowguard@postgres:5432/shadowguard
+    #   TELEPHONY_ENABLED: ${TELEPHONY_ENABLED:-false}
+    #   AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    #   AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    #   AWS_REGION: ${AWS_REGION:-us-east-1}
+    #   CONNECT_INSTANCE_ID: ${CONNECT_INSTANCE_ID:-}
+    #   CONNECT_CONTACT_FLOW_ID: ${CONNECT_CONTACT_FLOW_ID:-}
+    #   CONNECT_SOURCE_PHONE: ${CONNECT_SOURCE_PHONE:-}
+    #   ALERT_PHONE_NUMBER: ${ALERT_PHONE_NUMBER:-}
+    #   CALL_COOLDOWN_SECONDS: ${CALL_COOLDOWN_SECONDS:-300}
     environment:
       DATABASE_URL: postgresql://shadowguard:shadowguard@postgres:5432/shadowguard
-      VAPI_ENABLED: ${VAPI_ENABLED:-false}
-      VAPI_API_KEY: ${VAPI_API_KEY:-}
-      VAPI_PHONE_NUMBER_ID: ${VAPI_PHONE_NUMBER_ID:-}
-      VAPI_ASSISTANT_ID: ${VAPI_ASSISTANT_ID:-}
+      TELEPHONY_ENABLED: ${TELEPHONY_ENABLED:-false}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_PHONE_NUMBER: ${TWILIO_PHONE_NUMBER:-}
       ALERT_PHONE_NUMBER: ${ALERT_PHONE_NUMBER:-}
       CALL_COOLDOWN_SECONDS: ${CALL_COOLDOWN_SECONDS:-300}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      SERVICE_HOST: ${SERVICE_HOST:-}
 
   dashboard:
     build: ./dashboard
